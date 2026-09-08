@@ -3,6 +3,7 @@ namespace UnityRhi.Dlss.Urp
     /// <summary>A per-camera snapshot of the blended DLSS-NR Volume values.</summary>
     internal readonly struct DlssNrSettings
     {
+        internal readonly int IterationCount;
         internal readonly DlssNrPreset Preset;
         internal readonly DlssNrStyle Style;
         internal readonly float Intensity;
@@ -20,6 +21,7 @@ namespace UnityRhi.Dlss.Urp
 
         internal DlssNrSettings(DlssNrVolume volume)
         {
+            IterationCount = UnityEngine.Mathf.Max(1, volume.iterationCount.value);
             Preset = volume.preset.value;
             Style = volume.style.value;
             Intensity = volume.intensity.value;

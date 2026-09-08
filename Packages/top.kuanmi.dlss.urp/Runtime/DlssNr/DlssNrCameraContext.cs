@@ -43,6 +43,7 @@ namespace UnityRhi.Dlss.Urp
 
         internal int Width { get; }
         internal int Height { get; }
+        internal int IterationCount { get; }
         internal RenderTexture ColorRt { get; private set; }
         internal RenderTexture MotionRt { get; private set; }
         internal RenderTexture DepthRt { get; private set; }
@@ -56,7 +57,8 @@ namespace UnityRhi.Dlss.Urp
         private RhiTexture _motion;
         private RhiTexture _depth;
         private RhiTexture _output;
-        private DlssNrContext _dlss;
+        private RhiTexture _intermediate;
+        private DlssNrContext[] _iterations;
         private CommandList _commandList;
         private int _lastFrame = int.MinValue;
         private int _lastSettingsHash;
@@ -66,12 +68,14 @@ namespace UnityRhi.Dlss.Urp
         private bool _hasHistory;
         private bool _disposed;
 
-        internal DlssNrCameraContext(int width, int height, string cameraName)
+        internal DlssNrCameraContext(int width, int height, string cameraName, int iterationCount)
         {
             if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
             if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+            if (iterationCount <= 0) throw new ArgumentOutOfRangeException(nameof(iterationCount));
             Width = width;
             Height = height;
+            IterationCount = iterationCount;
 
             try
             {
@@ -101,7 +105,23 @@ namespace UnityRhi.Dlss.Urp
                     ResourceStates.RenderTarget, $"DLSS-NR {cameraName} Depth");
                 _output = Wrap(device, OutputRt, Format.RGBA16_FLOAT,
                     ResourceStates.UnorderedAccess, $"DLSS-NR {cameraName} Output");
-                _dlss = new DlssNrContext();
+                // Private to the native command stream; Unity/RenderGraph never accesses it.
+                // Two alternating outputs suffice regardless of the number of stages.
+                if (iterationCount > 1)
+                    _intermediate = device.CreateTexture(new TextureDesc
+                    {
+                        Width = (uint)width,
+                        Height = (uint)height,
+                        Format = Format.RGBA16_FLOAT,
+                        IsShaderResource = true,
+                        IsUAV = true,
+                        InitialState = ResourceStates.UnorderedAccess,
+                        KeepInitialState = true,
+                        DebugName = $"DLSS-NR {cameraName} Intermediate",
+                    });
+                _iterations = new DlssNrContext[iterationCount];
+                for (int i = 0; i < iterationCount; ++i)
+                    _iterations[i] = new DlssNrContext();
                 _commandList = new CommandList(8);
             }
             catch
@@ -143,36 +163,46 @@ namespace UnityRhi.Dlss.Urp
             try
             {
                 _commandList.BeginMarker("URP.DLSS-NR");
-                _dlss.Record(_commandList, new DlssNrDispatchDesc
+                RhiTexture input = _color;
+                for (int i = 0; i < IterationCount; ++i)
                 {
-                    Color = _color,
-                    Output = _output,
-                    MotionVectors = _motion,
-                    Depth = _depth,
-                    InputWidth = Width,
-                    InputHeight = Height,
-                    OutputWidth = Width,
-                    OutputHeight = Height,
-                    MotionVectorScaleX = parameters.MotionScaleX,
-                    MotionVectorScaleY = parameters.MotionScaleY,
-                    Intensity = parameters.Intensity,
-                    LocalToneStrength = parameters.LocalToneStrength,
-                    LocalStructureStrength = parameters.LocalStructureStrength,
-                    SkinStructureStrength = parameters.SkinStructureStrength,
-                    DepthInverted = SystemInfo.usesReversedZBuffer,
-                    Reset = parameters.Reset,
-                    UseAutoMask = parameters.UseAutoMask,
-                    UiCorrection = parameters.UiCorrection,
-                    Upscaling = false,
-                    Preset = parameters.Preset,
-                    Style = parameters.Style,
-                });
+                    // Choose parity so the last stage always writes the public OutputRt.
+                    RhiTexture output = ((IterationCount - i) & 1) == 1 ? _output : _intermediate;
+                    _commandList.BeginMarker($"URP.DLSS-NR Iteration {i + 1}");
+                    _iterations[i].Record(_commandList, new DlssNrDispatchDesc
+                    {
+                        Color = input,
+                        Output = output,
+                        MotionVectors = _motion,
+                        Depth = _depth,
+                        InputWidth = Width,
+                        InputHeight = Height,
+                        OutputWidth = Width,
+                        OutputHeight = Height,
+                        MotionVectorScaleX = parameters.MotionScaleX,
+                        MotionVectorScaleY = parameters.MotionScaleY,
+                        Intensity = parameters.Intensity,
+                        LocalToneStrength = parameters.LocalToneStrength,
+                        LocalStructureStrength = parameters.LocalStructureStrength,
+                        SkinStructureStrength = parameters.SkinStructureStrength,
+                        DepthInverted = SystemInfo.usesReversedZBuffer,
+                        Reset = parameters.Reset,
+                        UseAutoMask = parameters.UseAutoMask,
+                        UiCorrection = parameters.UiCorrection,
+                        Upscaling = false,
+                        Preset = parameters.Preset,
+                        Style = parameters.Style,
+                    });
+                    _commandList.EndMarker();
+                    input = output;
+                }
                 _commandList.EndMarker();
                 _commandList.Close();
                 _commandList.SubmitAndForget(commandBuffer);
             }
             catch
             {
+                ResetHistory();
                 // An exception while recording leaves a command list open. Replace
                 // it so a transient managed failure cannot poison later frames.
                 _commandList.Dispose();
@@ -187,8 +217,11 @@ namespace UnityRhi.Dlss.Urp
             _disposed = true;
             _commandList?.Dispose();
             _commandList = null;
-            _dlss?.Dispose();
-            _dlss = null;
+            if (_iterations != null)
+                foreach (DlssNrContext iteration in _iterations)
+                    iteration?.Dispose();
+            _iterations = null;
+            _intermediate?.Dispose(); _intermediate = null;
             _output?.Dispose(); _output = null;
             _depth?.Dispose(); _depth = null;
             _motion?.Dispose(); _motion = null;

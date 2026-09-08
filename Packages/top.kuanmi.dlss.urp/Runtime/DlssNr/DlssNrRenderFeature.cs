@@ -136,13 +136,14 @@ namespace UnityRhi.Dlss.Urp
             camera.GetInstanceID() + eye * 100000L;
 
         private DlssNrCameraContext GetContext(Camera camera, int eye, int width, int height,
-            bool xr)
+            bool xr, int iterationCount)
         {
             PruneDeadCameras();
             long key = MakeContextKey(camera, eye);
             if (_contexts.TryGetValue(key, out DlssNrCameraContext context))
             {
-                if (context.Width == width && context.Height == height)
+                if (context.Width == width && context.Height == height &&
+                    context.IterationCount == iterationCount)
                     return context;
                 context.Dispose();
                 _contexts.Remove(key);
@@ -150,7 +151,7 @@ namespace UnityRhi.Dlss.Urp
             }
 
             string name = xr ? $"{camera.name}_Eye{eye}" : camera.name;
-            context = new DlssNrCameraContext(width, height, name);
+            context = new DlssNrCameraContext(width, height, name, iterationCount);
             _contexts.Add(key, context);
             _contextCameras[key] = camera;
             return context;
@@ -367,7 +368,8 @@ namespace UnityRhi.Dlss.Urp
                 try
                 {
                     context = _feature.GetContext(camera, eye, width, height,
-                        cameraData.xr.enabled);
+                        cameraData.xr.enabled, settings.DebugMode == DlssNrDebugMode.Off
+                            ? settings.IterationCount : 1);
                 }
                 catch (Exception exception)
                 {

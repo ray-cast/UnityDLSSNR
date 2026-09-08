@@ -42,6 +42,9 @@ namespace UnityRhi.Dlss.Urp
         [Tooltip("Enable the DLSS Neural Rendering post-process.")]
         public BoolParameter enabled = new BoolParameter(false);
 
+        [Tooltip("Number of consecutive NR passes. Each pass processes the previous output with its own temporal history. Higher counts increase GPU time and memory usage.")]
+        public MinIntParameter iterationCount = new MinIntParameter(1, 1);
+
         public DlssNrPresetParameter preset = new DlssNrPresetParameter(DlssNrPreset.Default);
         public DlssNrStyleParameter style = new DlssNrStyleParameter(DlssNrStyle.Default);
 
