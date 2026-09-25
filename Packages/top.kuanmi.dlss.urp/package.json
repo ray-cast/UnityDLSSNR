@@ -2,10 +2,10 @@
   "name": "top.kuanmi.dlss.urp",
   "version": "0.1.0",
   "displayName": "UnityRHI DLSS for URP",
-  "description": "DLSS SuperSampling (IUpscaler), DLSS Frame Generation, and DLSS 5 Neural Rendering for Unity 6.3 URP via UnityRHI native NGX.",
-  "unity": "6000.3",
+  "description": "DLSS Frame Generation and DLSS 5 Neural Rendering for Unity 2022.3 URP 14 via UnityRHI native NGX. DLSS Super Resolution (IUpscaler) requires URP 17+ and is gated behind ENABLE_UPSCALER_FRAMEWORK.",
+  "unity": "2022.3",
   "dependencies": {
-    "com.unity.render-pipelines.universal": "17.0.0",
+    "com.unity.render-pipelines.universal": "14.0.0",
     "top.kuanmi.unityrhi": "1.0.0"
   },
   "author": {

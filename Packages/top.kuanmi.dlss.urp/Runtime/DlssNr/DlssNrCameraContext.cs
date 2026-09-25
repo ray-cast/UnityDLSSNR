@@ -48,15 +48,23 @@ namespace UnityRhi.Dlss.Urp
         internal RenderTexture MotionRt { get; private set; }
         internal RenderTexture DepthRt { get; private set; }
         internal RenderTexture OutputRt { get; private set; }
+        // Traditional-URP read-back target. The native stream copies OutputRt (UAV)
+        // into this, and — like Color/Motion/Depth — restores it to RenderTarget on
+        // close, so Unity's Blit reads it with a matching state. Blitting OutputRt
+        // directly reads black because the native stream leaves it in UnorderedAccess
+        // while Unity's tracker cannot observe that transition.
+        internal RenderTexture ResolveRt { get; private set; }
         internal RTHandle ColorHandle { get; private set; }
         internal RTHandle MotionHandle { get; private set; }
         internal RTHandle DepthHandle { get; private set; }
         internal RTHandle OutputHandle { get; private set; }
+        internal RTHandle ResolveHandle { get; private set; }
 
         private RhiTexture _color;
         private RhiTexture _motion;
         private RhiTexture _depth;
         private RhiTexture _output;
+        private RhiTexture _resolve;
         private RhiTexture _intermediate;
         private DlssNrContext[] _iterations;
         private CommandList _commandList;
@@ -87,16 +95,24 @@ namespace UnityRhi.Dlss.Urp
                     GraphicsFormat.R32_SFloat);
                 OutputRt = CreateRenderTexture($"DLSS-NR {cameraName} Output", width, height,
                     GraphicsFormat.R16G16B16A16_SFloat);
+                ResolveRt = CreateRenderTexture($"DLSS-NR {cameraName} Resolve", width, height,
+                    GraphicsFormat.R16G16B16A16_SFloat);
 
                 ColorHandle = RTHandles.Alloc(ColorRt);
                 MotionHandle = RTHandles.Alloc(MotionRt);
                 DepthHandle = RTHandles.Alloc(DepthRt);
                 OutputHandle = RTHandles.Alloc(OutputRt);
+                ResolveHandle = RTHandles.Alloc(ResolveRt);
 
                 Device device = Device.Instance;
-                // The prepare MRT leaves its attachments in RenderTarget state. The
-                // DLSS command stream restores that state so the next URP frame starts
-                // from the same contract. RenderGraph exposes Output as a UAV write.
+                // Color/motion/depth are written by the prepare MRT (RenderTarget) and
+                // read by the native stream, which restores them to RenderTarget so the
+                // next URP frame starts from the same contract.
+                // Output is written ONLY by the native stream (UAV) and read back by a
+                // Blit. In traditional URP (no RenderGraph) it must NOT be bound as a
+                // prepare render attachment, otherwise Unity's own state tracker records
+                // it as RenderTarget while the native stream leaves it in UnorderedAccess,
+                // and the Blit's RenderTarget->ShaderResource barrier reads black.
                 _color = Wrap(device, ColorRt, Format.RGBA16_FLOAT,
                     ResourceStates.RenderTarget, $"DLSS-NR {cameraName} Color");
                 _motion = Wrap(device, MotionRt, Format.RG16_FLOAT,
@@ -105,6 +121,10 @@ namespace UnityRhi.Dlss.Urp
                     ResourceStates.RenderTarget, $"DLSS-NR {cameraName} Depth");
                 _output = Wrap(device, OutputRt, Format.RGBA16_FLOAT,
                     ResourceStates.UnorderedAccess, $"DLSS-NR {cameraName} Output");
+                // CopyTexture destination + Blit source. RenderTarget initial state,
+                // restored by the native stream on close (same contract as the inputs).
+                _resolve = Wrap(device, ResolveRt, Format.RGBA16_FLOAT,
+                    ResourceStates.RenderTarget, $"DLSS-NR {cameraName} Resolve");
                 // Private to the native command stream; Unity/RenderGraph never accesses it.
                 // Two alternating outputs suffice regardless of the number of stages.
                 if (iterationCount > 1)
@@ -196,9 +216,17 @@ namespace UnityRhi.Dlss.Urp
                     _commandList.EndMarker();
                     input = output;
                 }
+                // Copy the UAV result into the resolve target within the native stream.
+                // The resolve target is restored to RenderTarget on close, so Unity's
+                // Blit reads it with a matching state. Reading OutputRt directly is black.
+                _commandList.BeginMarker("URP.DLSS-NR Resolve");
+                _commandList.CopyTexture(_resolve, TextureSlice.Default, _output, TextureSlice.Default);
+                _commandList.EndMarker();
                 _commandList.EndMarker();
                 _commandList.Close();
                 _commandList.SubmitAndForget(commandBuffer);
+
+                RhiCore.SignalSyncPoint(commandBuffer);
             }
             catch
             {
@@ -222,14 +250,17 @@ namespace UnityRhi.Dlss.Urp
                     iteration?.Dispose();
             _iterations = null;
             _intermediate?.Dispose(); _intermediate = null;
+            _resolve?.Dispose(); _resolve = null;
             _output?.Dispose(); _output = null;
             _depth?.Dispose(); _depth = null;
             _motion?.Dispose(); _motion = null;
             _color?.Dispose(); _color = null;
+            ResolveHandle?.Release(); ResolveHandle = null;
             OutputHandle?.Release(); OutputHandle = null;
             DepthHandle?.Release(); DepthHandle = null;
             MotionHandle?.Release(); MotionHandle = null;
             ColorHandle?.Release(); ColorHandle = null;
+            Destroy(ResolveRt); ResolveRt = null;
             Destroy(OutputRt); OutputRt = null;
             Destroy(DepthRt); DepthRt = null;
             Destroy(MotionRt); MotionRt = null;

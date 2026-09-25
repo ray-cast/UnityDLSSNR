@@ -2,13 +2,12 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
 
 namespace UnityRhi.Dlss.Urp
 {
     /// <summary>
-    /// SDR DLSS Neural Rendering for Unity 6.3 URP.
+    /// SDR DLSS Neural Rendering for Unity 2022.3 URP 14.
     /// Default injection is before post/upscale so the Game camera order is
     /// raster → NR → remaining post. XR uses per-eye history at native resolution
     /// (multipass or single-pass instanced texture arrays).
@@ -45,6 +44,7 @@ namespace UnityRhi.Dlss.Urp
         private bool _loggedSrStack;
         private bool _loggedNrThenSr;
         private bool _loggedXr;
+        private int _streamDiagFrames;
 
         public override void Create()
         {
@@ -58,9 +58,8 @@ namespace UnityRhi.Dlss.Urp
                 CoreUtils.Destroy(_copyMaterial);
             _prepareMaterial = prepareInputsShader != null
                 ? CoreUtils.CreateEngineMaterial(prepareInputsShader) : null;
-            // RenderGraph records prepare, debug and copy draws separately.
-            // Independent materials keep later pass bindings from mutating
-            // earlier recorded draws.
+            // Separate draws bind their own material state. Independent materials
+            // keep later pass bindings from mutating earlier recorded draws.
             _debugMaterial = prepareInputsShader != null
                 ? CoreUtils.CreateEngineMaterial(prepareInputsShader) : null;
             _copyMaterial = prepareInputsShader != null
@@ -100,8 +99,8 @@ namespace UnityRhi.Dlss.Urp
                 return;
 
             _pass.renderPassEvent = renderPassEvent;
+            _pass.Renderer = renderer;
             _pass.ConfigureInput(ScriptableRenderPassInput.Depth | ScriptableRenderPassInput.Motion);
-            _pass.requiresIntermediateTexture = true;
             renderer.EnqueuePass(_pass);
         }
 
@@ -185,50 +184,20 @@ namespace UnityRhi.Dlss.Urp
             private static readonly int DebugMotionScaleYId = UnityEngine.Shader.PropertyToID("_DlssNrDebugMotionScaleY");
             private static readonly int DebugMotionRangeId = UnityEngine.Shader.PropertyToID("_DlssNrDebugMotionRange");
             private static readonly int DebugDepthRangeId = UnityEngine.Shader.PropertyToID("_DlssNrDebugDepthRange");
+            // URP-bound global textures. ConfigureInput(Depth | Motion) guarantees
+            // URP resolves and binds these before this pass runs.
+            private static readonly int CameraDepthTextureId =
+                UnityEngine.Shader.PropertyToID("_CameraDepthTexture");
+            private static readonly int MotionVectorTextureId =
+                UnityEngine.Shader.PropertyToID("_MotionVectorTexture");
             private static readonly string ColorArrayKeyword = "_DLSSNR_COLOR_ARRAY";
             private static readonly string DepthArrayKeyword = "_DLSSNR_DEPTH_ARRAY";
             private static readonly string MotionArrayKeyword = "_DLSSNR_MOTION_ARRAY";
             private readonly DlssNrRenderFeature _feature;
+            private readonly MaterialPropertyBlock _properties = new MaterialPropertyBlock();
 
-            private sealed class PreparePassData
-            {
-                public TextureHandle Color;
-                public TextureHandle Depth;
-                public TextureHandle Motion;
-                public Material Material;
-                public MaterialPropertyBlock Properties;
-                public bool ColorArray;
-                public bool DepthArray;
-                public bool MotionArray;
-                public float EyeSlice;
-            }
-
-            private sealed class DispatchPassData
-            {
-                public DlssNrRenderFeature Feature;
-                public DlssNrCameraContext Context;
-                public DlssNrCameraContext.DispatchParameters Parameters;
-            }
-
-            private sealed class DebugPassData
-            {
-                public TextureHandle Depth;
-                public TextureHandle Motion;
-                public Material Material;
-                public MaterialPropertyBlock Properties;
-                public int Mode;
-                public float MotionScaleX;
-                public float MotionScaleY;
-                public float MotionRange;
-                public float DepthRange;
-            }
-
-            private sealed class CopyPassData
-            {
-                public TextureHandle Source;
-                public Material Material;
-                public MaterialPropertyBlock Properties;
-            }
+            /// <summary>Renderer whose color target is the NR input/output.</summary>
+            internal ScriptableRenderer Renderer { get; set; }
 
             internal DlssNrPass(DlssNrRenderFeature feature)
             {
@@ -236,12 +205,15 @@ namespace UnityRhi.Dlss.Urp
                 profilingSampler = new ProfilingSampler("DLSS Neural Rendering");
             }
 
-            public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+            public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
             {
-                UniversalResourceData resources = frameData.Get<UniversalResourceData>();
-                UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+                if (_feature._prepareMaterial == null || _feature._debugMaterial == null ||
+                    _feature._copyMaterial == null || Renderer == null)
+                    return;
+
+                ref CameraData cameraData = ref renderingData.cameraData;
                 Camera camera = cameraData.camera;
-                if (camera == null || resources.isActiveTargetBackBuffer)
+                if (camera == null)
                     return;
                 if (_feature.finalCameraInStackOnly && !cameraData.resolveFinalTarget)
                     return;
@@ -259,32 +231,28 @@ namespace UnityRhi.Dlss.Urp
                     return;
                 }
 
-                TextureHandle sourceColor = resources.activeColorTexture;
-                TextureHandle sourceDepth = resources.cameraDepthTexture;
-                TextureHandle sourceMotion = resources.motionVectorColor;
-                if (!sourceColor.IsValid() || !sourceDepth.IsValid() || !sourceMotion.IsValid())
+                RTHandle sourceColor = Renderer.cameraColorTargetHandle;
+                var sourceDepth = UnityEngine.Shader.GetGlobalTexture(CameraDepthTextureId) as RenderTexture;
+                var sourceMotion = UnityEngine.Shader.GetGlobalTexture(MotionVectorTextureId) as RenderTexture;
+                if (sourceColor == null || sourceColor.rt == null ||
+                    sourceDepth == null || sourceMotion == null)
                     return;
 
-                UnityEngine.Rendering.RenderGraphModule.TextureDesc sourceDesc =
-                    renderGraph.GetTextureDesc(sourceColor);
-                int width = sourceDesc.width;
-                int height = sourceDesc.height;
+                RenderTexture sourceColorRt = sourceColor.rt;
+                int width = sourceColorRt.width;
+                int height = sourceColorRt.height;
                 if (width <= 0 || height <= 0)
                     return;
 
-                UnityEngine.Rendering.RenderGraphModule.TextureDesc depthDesc =
-                    renderGraph.GetTextureDesc(sourceDepth);
-                UnityEngine.Rendering.RenderGraphModule.TextureDesc motionDesc =
-                    renderGraph.GetTextureDesc(sourceMotion);
-                bool auxLowerRes = depthDesc.width < width || depthDesc.height < height ||
-                    motionDesc.width < width || motionDesc.height < height;
+                bool auxLowerRes = sourceDepth.width < width || sourceDepth.height < height ||
+                    sourceMotion.width < width || sourceMotion.height < height;
                 if (auxLowerRes && !_feature._loggedSrStack)
                 {
                     _feature._loggedSrStack = true;
                     Debug.Log(
                         $"[UnityRHI.DLSS-NR] SR→NR stack: color {width}x{height}, " +
-                        $"depth {depthDesc.width}x{depthDesc.height}, " +
-                        $"motion {motionDesc.width}x{motionDesc.height}. " +
+                        $"depth {sourceDepth.width}x{sourceDepth.height}, " +
+                        $"motion {sourceMotion.width}x{sourceMotion.height}. " +
                         "Upsampling depth/MV into NR inputs.");
                 }
                 else if (!auxLowerRes && !_feature._loggedNrThenSr)
@@ -295,7 +263,7 @@ namespace UnityRhi.Dlss.Urp
                         "(native / render resolution).");
                 }
 
-                ResolveEyes(cameraData, sourceDesc, out int firstEye, out int eyeCount,
+                ResolveEyes(cameraData, sourceColorRt, out int firstEye, out int eyeCount,
                     out bool texArray);
                 if (texArray && !_feature._loggedXr)
                 {
@@ -310,34 +278,35 @@ namespace UnityRhi.Dlss.Urp
                         $"[UnityRHI.DLSS-NR] XR multipass eye {firstEye} at {width}x{height}.");
                 }
 
-                TextureHandle destColor = resources.cameraColor.IsValid()
-                    ? resources.cameraColor
-                    : sourceColor;
-                bool colorArray = IsTexArray(sourceDesc);
-                bool depthArray = IsTexArray(depthDesc);
-                bool motionArray = IsTexArray(motionDesc);
+                bool colorArray = IsTexArray(sourceColorRt);
+                bool depthArray = IsTexArray(sourceDepth);
+                bool motionArray = IsTexArray(sourceMotion);
 
-                TextureHandle lastOutput = TextureHandle.nullHandle;
-                for (int i = 0; i < eyeCount; ++i)
+                CommandBuffer cmd = CommandBufferPool.Get();
+                using (new ProfilingScope(cmd, profilingSampler))
                 {
-                    int eye = firstEye + i;
-                    if (!TryRecordEye(renderGraph, cameraData, camera, settings,
-                            sourceColor, sourceDepth, sourceMotion, destColor, width, height,
-                            eye, texArray, colorArray, depthArray, motionArray, out lastOutput))
-                        return;
+                    for (int i = 0; i < eyeCount; ++i)
+                    {
+                        int eye = firstEye + i;
+                        if (!TryRecordEye(cmd, cameraData, camera, settings,
+                                sourceColor, sourceDepth, sourceMotion, width, height,
+                                eye, texArray, colorArray, depthArray, motionArray))
+                        {
+                            CommandBufferPool.Release(cmd);
+                            return;
+                        }
+                    }
                 }
 
-                if (!texArray && lastOutput.IsValid())
-                    resources.cameraColor = lastOutput;
+                context.ExecuteCommandBuffer(cmd);
+                CommandBufferPool.Release(cmd);
             }
 
-            private static bool IsTexArray(
-                in UnityEngine.Rendering.RenderGraphModule.TextureDesc desc) =>
-                desc.dimension == UnityEngine.Rendering.TextureDimension.Tex2DArray &&
-                desc.slices > 1;
+            private static bool IsTexArray(RenderTexture texture) =>
+                texture.dimension == UnityEngine.Rendering.TextureDimension.Tex2DArray &&
+                texture.volumeDepth > 1;
 
-            private static void ResolveEyes(UniversalCameraData cameraData,
-                in UnityEngine.Rendering.RenderGraphModule.TextureDesc sourceDesc,
+            private static void ResolveEyes(CameraData cameraData, RenderTexture sourceColor,
                 out int firstEye, out int eyeCount, out bool texArray)
             {
                 // NativeNrd keys history by cameraId + multipassId * 100000. Single-pass
@@ -345,7 +314,7 @@ namespace UnityRhi.Dlss.Urp
                 // so we extract each array slice into a per-eye 2D context.
                 texArray = false;
                 if (cameraData.xr.enabled && cameraData.xr.singlePassEnabled &&
-                    IsTexArray(sourceDesc))
+                    IsTexArray(sourceColor))
                 {
                     firstEye = 0;
                     eyeCount = Mathf.Max(1, cameraData.xr.viewCount);
@@ -357,17 +326,16 @@ namespace UnityRhi.Dlss.Urp
                 eyeCount = 1;
             }
 
-            private bool TryRecordEye(RenderGraph renderGraph,
-                UniversalCameraData cameraData, Camera camera, in DlssNrSettings settings,
-                TextureHandle sourceColor, TextureHandle sourceDepth, TextureHandle sourceMotion,
-                TextureHandle destColor, int width, int height, int eye, bool texArray,
-                bool colorArray, bool depthArray, bool motionArray, out TextureHandle output)
+            private bool TryRecordEye(CommandBuffer cmd,
+                CameraData cameraData, Camera camera, in DlssNrSettings settings,
+                RTHandle sourceColor, RenderTexture sourceDepth, RenderTexture sourceMotion,
+                int width, int height, int eye, bool texArray,
+                bool colorArray, bool depthArray, bool motionArray)
             {
-                output = TextureHandle.nullHandle;
-                DlssNrCameraContext context;
+                DlssNrCameraContext ctx;
                 try
                 {
-                    context = _feature.GetContext(camera, eye, width, height,
+                    ctx = _feature.GetContext(camera, eye, width, height,
                         cameraData.xr.enabled, settings.DebugMode == DlssNrDebugMode.Off
                             ? settings.IterationCount : 1);
                 }
@@ -381,150 +349,97 @@ namespace UnityRhi.Dlss.Urp
                     return false;
                 }
 
-                TextureHandle color = renderGraph.ImportTexture(context.ColorHandle);
-                TextureHandle depth = renderGraph.ImportTexture(context.DepthHandle);
-                TextureHandle motion = renderGraph.ImportTexture(context.MotionHandle);
-                output = renderGraph.ImportTexture(context.OutputHandle);
-
-                using (IRasterRenderGraphBuilder builder =
-                    renderGraph.AddRasterRenderPass<PreparePassData>(
-                        texArray ? $"DLSS-NR Prepare Inputs Eye {eye}" : "DLSS-NR Prepare Inputs",
-                        out PreparePassData passData))
+                // Prepare: copy color/depth/motion into the persistent NGX inputs.
+                // MRT order matches the shader's SV_Target0=color, 1=motion, 2=depth.
+                // The shader's SV_Target3 fallback is intentionally left unbound: the
+                // native stream owns OutputRt (UAV). Binding it as a render attachment
+                // here would make Unity's state tracker record OutputRt as RenderTarget
+                // and the later Blit would read black (native leaves it UnorderedAccess).
+                SetKeyword(_feature._prepareMaterial, ColorArrayKeyword, colorArray);
+                SetKeyword(_feature._prepareMaterial, DepthArrayKeyword, depthArray);
+                SetKeyword(_feature._prepareMaterial, MotionArrayKeyword, motionArray);
+                var prepareTargets = new RenderTargetIdentifier[]
                 {
-                    passData.Color = sourceColor;
-                    passData.Depth = sourceDepth;
-                    passData.Motion = sourceMotion;
-                    passData.Material = _feature._prepareMaterial;
-                    passData.Properties = new MaterialPropertyBlock();
-                    passData.ColorArray = colorArray;
-                    passData.DepthArray = depthArray;
-                    passData.MotionArray = motionArray;
-                    passData.EyeSlice = eye;
-                    builder.UseTexture(sourceColor, AccessFlags.Read);
-                    builder.UseTexture(sourceDepth, AccessFlags.Read);
-                    builder.UseTexture(sourceMotion, AccessFlags.Read);
-                    builder.SetRenderAttachment(color, 0, AccessFlags.WriteAll);
-                    builder.SetRenderAttachment(motion, 1, AccessFlags.WriteAll);
-                    builder.SetRenderAttachment(depth, 2, AccessFlags.WriteAll);
-                    builder.SetRenderAttachment(output, 3, AccessFlags.WriteAll);
-                    builder.AllowPassCulling(false);
-                    builder.SetRenderFunc(static (PreparePassData data, RasterGraphContext rgContext) =>
-                    {
-                        SetKeyword(data.Material, ColorArrayKeyword, data.ColorArray);
-                        SetKeyword(data.Material, DepthArrayKeyword, data.DepthArray);
-                        SetKeyword(data.Material, MotionArrayKeyword, data.MotionArray);
-                        // DrawProcedural keeps a live Material reference. Single-pass records
-                        // one prepare per eye against the same material, so SetTexture/SetFloat
-                        // would both execute as the last eye (right). MPB is copied per draw.
-                        data.Properties.Clear();
-                        data.Properties.SetTexture(InputColorId, data.Color);
-                        data.Properties.SetTexture(InputDepthId, data.Depth);
-                        data.Properties.SetTexture(InputMotionId, data.Motion);
-                        data.Properties.SetFloat(EyeSliceId, data.EyeSlice);
-                        rgContext.cmd.DrawProcedural(Matrix4x4.identity, data.Material, 0,
-                            MeshTopology.Triangles, 3, 1, data.Properties);
-                    });
-                }
+                    ctx.ColorHandle.nameID,
+                    ctx.MotionHandle.nameID,
+                    ctx.DepthHandle.nameID,
+                };
+                cmd.SetRenderTarget(prepareTargets, ctx.ColorHandle.nameID);
+                cmd.SetViewport(new Rect(0f, 0f, width, height));
+                _properties.Clear();
+                _properties.SetTexture(InputColorId, sourceColor);
+                _properties.SetTexture(InputDepthId, sourceDepth);
+                _properties.SetTexture(InputMotionId, sourceMotion);
+                _properties.SetFloat(EyeSliceId, eye);
+                cmd.DrawProcedural(Matrix4x4.identity, _feature._prepareMaterial, 0,
+                    MeshTopology.Triangles, 3, 1, _properties);
 
                 GetEyePose(cameraData, camera, eye,
                     out Vector3 position, out Quaternion rotation, out Matrix4x4 projection);
 
                 if (settings.DebugMode != DlssNrDebugMode.Off)
                 {
-                    using (IRasterRenderGraphBuilder builder =
-                        renderGraph.AddRasterRenderPass<DebugPassData>("DLSS-NR Debug Inputs",
-                            out DebugPassData passData, profilingSampler))
-                    {
-                        passData.Depth = depth;
-                        passData.Motion = motion;
-                        passData.Material = _feature._debugMaterial;
-                        passData.Properties = new MaterialPropertyBlock();
-                        passData.Mode = (int)settings.DebugMode;
-                        passData.MotionScaleX = -width * settings.MotionVectorScale.x;
-                        passData.MotionScaleY = -height * settings.MotionVectorScale.y;
-                        passData.MotionRange = settings.DebugMotionRange;
-                        passData.DepthRange = settings.DebugDepthRange;
-                        builder.UseTexture(depth, AccessFlags.Read);
-                        builder.UseTexture(motion, AccessFlags.Read);
-                        builder.SetRenderAttachment(output, 0, AccessFlags.WriteAll);
-                        builder.AllowPassCulling(false);
-                        builder.SetRenderFunc(static (DebugPassData data, RasterGraphContext rgContext) =>
-                        {
-                            data.Properties.Clear();
-                            data.Properties.SetTexture(InputDepthId, data.Depth);
-                            data.Properties.SetTexture(InputMotionId, data.Motion);
-                            data.Properties.SetInt(DebugModeId, data.Mode);
-                            data.Properties.SetFloat(DebugMotionScaleXId, data.MotionScaleX);
-                            data.Properties.SetFloat(DebugMotionScaleYId, data.MotionScaleY);
-                            data.Properties.SetFloat(DebugMotionRangeId, data.MotionRange);
-                            data.Properties.SetFloat(DebugDepthRangeId, data.DepthRange);
-                            rgContext.cmd.DrawProcedural(Matrix4x4.identity, data.Material, 1,
-                                MeshTopology.Triangles, 3, 1, data.Properties);
-                        });
-                    }
+                    cmd.SetRenderTarget(ctx.OutputHandle.nameID);
+                    cmd.SetViewport(new Rect(0f, 0f, width, height));
+                    _properties.Clear();
+                    _properties.SetTexture(InputDepthId, ctx.DepthHandle);
+                    _properties.SetTexture(InputMotionId, ctx.MotionHandle);
+                    _properties.SetInt(DebugModeId, (int)settings.DebugMode);
+                    _properties.SetFloat(DebugMotionScaleXId, -width * settings.MotionVectorScale.x);
+                    _properties.SetFloat(DebugMotionScaleYId, -height * settings.MotionVectorScale.y);
+                    _properties.SetFloat(DebugMotionRangeId, settings.DebugMotionRange);
+                    _properties.SetFloat(DebugDepthRangeId, settings.DebugDepthRange);
+                    cmd.DrawProcedural(Matrix4x4.identity, _feature._debugMaterial, 1,
+                        MeshTopology.Triangles, 3, 1, _properties);
 
-                    if (texArray)
-                        RecordCopyToSlice(renderGraph, output, destColor, eye);
+                    // Debug output is written by Unity raster into OutputHandle.
+                    ResolveOutput(cmd, ctx.OutputHandle, sourceColor, texArray, eye, width, height);
                     return true;
                 }
 
-                using (IUnsafeRenderGraphBuilder builder =
-                    renderGraph.AddUnsafePass<DispatchPassData>(
-                        texArray ? $"DLSS Neural Rendering Eye {eye}" : "DLSS Neural Rendering",
-                        out DispatchPassData passData, profilingSampler))
+                DlssNrCameraContext.DispatchParameters parameters =
+                    ctx.BeginFrame(Time.frameCount, position, rotation, projection, settings);
+                try
                 {
-                    passData.Feature = _feature;
-                    passData.Context = context;
-                    passData.Parameters = context.BeginFrame(Time.frameCount, position,
-                        rotation, projection, settings);
-                    builder.UseTexture(output, AccessFlags.WriteAll);
-                    builder.AllowPassCulling(false);
-                    builder.AllowGlobalStateModification(true);
-                    builder.SetRenderFunc(static (DispatchPassData data, UnsafeGraphContext unsafeContext) =>
+                    // The native NR stream reads the prepared inputs, writes OutputRt (UAV)
+                    // and copies it into ResolveRt, restoring ResolveRt to RenderTarget.
+                    ctx.Record(cmd, parameters);
+                }
+                catch (Exception exception)
+                {
+                    if (!_feature._warnedFailure)
                     {
-                        try
-                        {
-                            CommandBuffer commandBuffer =
-                                CommandBufferHelpers.GetNativeCommandBuffer(unsafeContext.cmd);
-                            data.Context.Record(commandBuffer, data.Parameters);
-                        }
-                        catch (Exception exception)
-                        {
-                            if (!data.Feature._warnedFailure)
-                            {
-                                data.Feature._warnedFailure = true;
-                                Debug.LogError($"[UnityRHI.DLSS-NR] Dispatch failed. {exception}");
-                            }
-                        }
-                    });
+                        _feature._warnedFailure = true;
+                        Debug.LogError($"[UnityRHI.DLSS-NR] Dispatch failed. {exception}");
+                    }
+                    return false;
                 }
 
-                if (texArray)
-                    RecordCopyToSlice(renderGraph, output, destColor, eye);
+                // The native result is read back from ResolveHandle (see ctx.Record).
+                ResolveOutput(cmd, ctx.ResolveHandle, sourceColor, texArray, eye, width, height);
                 return true;
             }
 
-            private void RecordCopyToSlice(RenderGraph renderGraph, TextureHandle source,
-                TextureHandle destination, int eye)
+            // Move the NR result back onto the camera color. For single 2D targets a
+            // full blit; for XR texture arrays a per-eye slice copy.
+            // The debug path passes OutputHandle (written by Unity raster). The native
+            // path passes ResolveHandle (the native stream's copy of OutputRt), whose
+            // state Unity can track; blitting OutputHandle after a native write is black.
+            private void ResolveOutput(CommandBuffer cmd, RTHandle source,
+                RTHandle destination, bool texArray, int eye, int width, int height)
             {
-                using (IRasterRenderGraphBuilder builder =
-                    renderGraph.AddRasterRenderPass<CopyPassData>(
-                        $"DLSS-NR Copy Eye {eye}", out CopyPassData passData))
+                if (!texArray)
                 {
-                    passData.Source = source;
-                    passData.Material = _feature._copyMaterial;
-                    passData.Properties = new MaterialPropertyBlock();
-                    builder.UseTexture(source, AccessFlags.Read);
-                    builder.SetRenderAttachment(destination, 0, AccessFlags.ReadWrite, 0, eye);
-                    builder.AllowPassCulling(false);
-                    builder.SetRenderFunc(static (CopyPassData data, RasterGraphContext rgContext) =>
-                    {
-                        data.Properties.Clear();
-                        data.Properties.SetTexture(CopySourceId, data.Source);
-                        rgContext.cmd.DrawProcedural(Matrix4x4.identity, data.Material, 2,
-                            MeshTopology.Triangles, 3, 1, data.Properties);
-                    });
+                    Blitter.BlitCameraTexture(cmd, source, destination);
+                    return;
                 }
+
+                cmd.SetRenderTarget(destination.nameID, 0, CubemapFace.Unknown, eye);
+                cmd.SetViewport(new Rect(0f, 0f, width, height));
+                _properties.Clear();
+                _properties.SetTexture(CopySourceId, source);
+                cmd.DrawProcedural(Matrix4x4.identity, _feature._copyMaterial, 2,
+                    MeshTopology.Triangles, 3, 1, _properties);
             }
 
             private static void SetKeyword(Material material, string keyword, bool enabled)
@@ -535,7 +450,7 @@ namespace UnityRhi.Dlss.Urp
                     material.DisableKeyword(keyword);
             }
 
-            private static void GetEyePose(UniversalCameraData cameraData, Camera camera,
+            private static void GetEyePose(CameraData cameraData, Camera camera,
                 int viewIndex, out Vector3 position, out Quaternion rotation,
                 out Matrix4x4 projection)
             {

@@ -37,6 +37,8 @@ Shader "Hidden/UnityRHI/DLSS-NR/PrepareInputs"
             #else
             TEXTURE2D(_DlssNrInputMotion);
             #endif
+            SAMPLER(sampler_LinearClamp);
+            SAMPLER(sampler_PointClamp);
             float _DlssNrEyeSlice;
 
             struct Attributes
@@ -113,6 +115,7 @@ Shader "Hidden/UnityRHI/DLSS-NR/PrepareInputs"
 
             TEXTURE2D(_DlssNrInputDepth);
             TEXTURE2D(_DlssNrInputMotion);
+            SAMPLER(sampler_PointClamp);
 
             int _DlssNrDebugMode;
             float _DlssNrDebugMotionScaleX;
@@ -197,6 +200,7 @@ Shader "Hidden/UnityRHI/DLSS-NR/PrepareInputs"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
             TEXTURE2D(_DlssNrCopySource);
+            SAMPLER(sampler_LinearClamp);
 
             struct CopyAttributes
             {

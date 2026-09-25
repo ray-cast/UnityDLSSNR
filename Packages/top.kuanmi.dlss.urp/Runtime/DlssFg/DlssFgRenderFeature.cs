@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
 
 namespace UnityRhi.Dlss.Urp
@@ -145,6 +144,7 @@ namespace UnityRhi.Dlss.Urp
             else
                 DisableFrameGeneration();
             _pass.renderPassEvent = renderPassEvent;
+            _pass.Renderer = renderer;
             _pass.ConfigureInput(ScriptableRenderPassInput.Depth | ScriptableRenderPassInput.Motion);
             renderer.EnqueuePass(_pass);
         }
@@ -288,14 +288,22 @@ namespace UnityRhi.Dlss.Urp
             private static readonly int DebugParamsId = UnityEngine.Shader.PropertyToID("_DlssFgDebugParams");
             private static readonly int DebugMotionScaleId =
                 UnityEngine.Shader.PropertyToID("_DlssFgDebugMotionScale");
-            private readonly DlssFgRenderFeature _feature;
+            // URP-bound global textures. ConfigureInput(Depth | Motion) guarantees
+            // URP resolves and binds these before this pass runs.
+            private static readonly int CameraDepthTextureId =
+                UnityEngine.Shader.PropertyToID("_CameraDepthTexture");
+            private static readonly int MotionVectorTextureId =
+                UnityEngine.Shader.PropertyToID("_MotionVectorTexture");
 
-            private sealed class PreparePassData
+            private readonly DlssFgRenderFeature _feature;
+            private readonly MaterialPropertyBlock _properties = new MaterialPropertyBlock();
+
+            /// <summary>Renderer whose color target backs the debug view.</summary>
+            internal ScriptableRenderer Renderer { get; set; }
+
+            // A per-camera snapshot passed to the native submission after the copy.
+            private sealed class SubmitData
             {
-                public TextureHandle Depth;
-                public TextureHandle Motion;
-                public Material Material;
-                public MaterialPropertyBlock Properties;
                 public DlssFgCameraContext Context;
                 public Matrix4x4 ViewToClip;
                 public Matrix4x4 ViewProj;
@@ -315,24 +323,6 @@ namespace UnityRhi.Dlss.Urp
                 public int FrameIndex;
                 public bool Reset;
                 public bool ColorBuffersHdr;
-                public bool SubmitToNgx;
-            }
-
-            private sealed class DebugPassData
-            {
-                public TextureHandle Depth;
-                public TextureHandle Motion;
-                public Material Material;
-                public MaterialPropertyBlock Properties;
-                public Matrix4x4 ClipToPrevClip;
-                public Vector4 Size;
-                public Vector4 Params;
-                public Vector4 MotionScale;
-            }
-
-            private sealed class SubmitPassData
-            {
-                public PreparePassData Inputs;
             }
 
             private static bool s_loggedSubmit;
@@ -343,10 +333,12 @@ namespace UnityRhi.Dlss.Urp
                 profilingSampler = new ProfilingSampler("DLSS Frame Generation");
             }
 
-            public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+            public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
             {
-                UniversalResourceData resources = frameData.Get<UniversalResourceData>();
-                UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
+                if (_feature._prepareMaterial == null)
+                    return;
+
+                ref CameraData cameraData = ref renderingData.cameraData;
                 Camera camera = cameraData.camera;
                 if (camera == null)
                     return;
@@ -358,27 +350,25 @@ namespace UnityRhi.Dlss.Urp
                 if (cameraData.xr.enabled)
                     return;
 
-                TextureHandle sourceDepth = resources.cameraDepthTexture;
-                TextureHandle sourceMotion = resources.motionVectorColor;
-                if (!sourceDepth.IsValid() || !sourceMotion.IsValid())
+                // URP publishes depth and motion as global textures once
+                // ConfigureInput requests them. NGX consumes copies of both.
+                var sourceDepth = UnityEngine.Shader.GetGlobalTexture(CameraDepthTextureId) as RenderTexture;
+                var sourceMotion = UnityEngine.Shader.GetGlobalTexture(MotionVectorTextureId) as RenderTexture;
+                if (sourceDepth == null || sourceMotion == null)
                     return;
 
-                UnityEngine.Rendering.RenderGraphModule.TextureDesc depthDesc =
-                    renderGraph.GetTextureDesc(sourceDepth);
-                UnityEngine.Rendering.RenderGraphModule.TextureDesc motionDesc =
-                    renderGraph.GetTextureDesc(sourceMotion);
-                int width = Mathf.Min(depthDesc.width, motionDesc.width);
-                int height = Mathf.Min(depthDesc.height, motionDesc.height);
+                int width = Mathf.Min(sourceDepth.width, sourceMotion.width);
+                int height = Mathf.Min(sourceDepth.height, sourceMotion.height);
                 if (width <= 0 || height <= 0)
                     return;
-                if (IsTexArray(depthDesc) || IsTexArray(motionDesc))
+                if (IsTexArray(sourceDepth) || IsTexArray(sourceMotion))
                     return;
 
                 var settings = new DlssFgSettings(_feature);
-                DlssFgCameraContext context;
+                DlssFgCameraContext ctx;
                 try
                 {
-                    context = _feature.GetContext(camera, width, height);
+                    ctx = _feature.GetContext(camera, width, height);
                 }
                 catch (Exception exception)
                 {
@@ -406,141 +396,107 @@ namespace UnityRhi.Dlss.Urp
                 Matrix4x4 viewProj = viewToClip * view;
                 Vector3 position = camera.transform.position;
                 Quaternion rotation = camera.transform.rotation;
-                context.BeginFrame(Time.frameCount, position, rotation, projection, viewProj,
+                ctx.BeginFrame(Time.frameCount, position, rotation, projection, viewProj,
                     settings, out Matrix4x4 prevViewProj, out bool reset);
                 Vector2 jitterPixels = ExtractJitterPixels(cameraData, projection, width, height);
 
-                TextureHandle motion = renderGraph.ImportTexture(context.MotionHandle);
-                TextureHandle depth = renderGraph.ImportTexture(context.DepthHandle);
+                bool submitToNgx = !Application.isEditor && _feature.RuntimeEnabled &&
+                    RhiCore.IsD3D12Active && RhiCore.IsNgxFrameGenerationAvailable;
 
-                PreparePassData preparedInputs;
-                using (IRasterRenderGraphBuilder builder =
-                    renderGraph.AddRasterRenderPass<PreparePassData>(
-                        "DLSS-G Prepare Inputs", out PreparePassData passData, profilingSampler))
+                CommandBuffer cmd = CommandBufferPool.Get();
+                using (new ProfilingScope(cmd, profilingSampler))
                 {
-                    preparedInputs = passData;
-                    passData.Depth = sourceDepth;
-                    passData.Motion = sourceMotion;
-                    passData.Material = _feature._prepareMaterial;
-                    passData.Properties = new MaterialPropertyBlock();
-                    passData.Context = context;
-                    passData.ViewToClip = viewToClip;
-                    passData.ViewProj = viewProj;
-                    passData.PrevViewProj = prevViewProj;
-                    passData.Position = position;
-                    passData.Up = camera.transform.up;
-                    passData.Right = camera.transform.right;
-                    passData.Forward = camera.transform.forward;
-                    passData.JitterPixels = jitterPixels;
-                    // DLSS-G consumes current-to-previous motion in pixels. URP
-                    // stores previous-to-current motion in normalized screen UV.
-                    passData.MotionScale = new Vector2(-width, -height);
-                    passData.Near = Mathf.Max(1e-4f, camera.nearClipPlane);
-                    passData.Far = camera.farClipPlane;
-                    passData.Fov = camera.fieldOfView * Mathf.Deg2Rad;
-                    passData.Aspect = (float)width / Mathf.Max(1, height);
-                    passData.ColorWidth = Mathf.Max(1, Screen.width);
-                    passData.ColorHeight = Mathf.Max(1, Screen.height);
-                    passData.FrameIndex = Time.frameCount;
-                    passData.Reset = reset;
-                    passData.ColorBuffersHdr = cameraData.isHDROutputActive;
-                    passData.SubmitToNgx = !Application.isEditor && _feature.RuntimeEnabled &&
-                        RhiCore.IsD3D12Active && RhiCore.IsNgxFrameGenerationAvailable;
-                    builder.UseTexture(sourceDepth, AccessFlags.Read);
-                    builder.UseTexture(sourceMotion, AccessFlags.Read);
-                    builder.SetRenderAttachment(motion, 0, AccessFlags.WriteAll);
-                    builder.SetRenderAttachment(depth, 1, AccessFlags.WriteAll);
-                    builder.AllowPassCulling(false);
-                    builder.SetRenderFunc(static (PreparePassData data, RasterGraphContext rgContext) =>
+                    // Prepare: copy URP depth/motion into the persistent NGX inputs.
+                    // MRT order matches the shader's SV_Target0=motion, SV_Target1=depth.
+                    var targets = new RenderTargetIdentifier[]
                     {
-                        data.Properties.Clear();
-                        data.Properties.SetTexture(InputDepthId, data.Depth);
-                        data.Properties.SetTexture(InputMotionId, data.Motion);
-                        data.Properties.SetVector(DepthScaleBiasId,
-                            GetNgxTextureScaleBias(rgContext, data.Depth));
-                        data.Properties.SetVector(MotionScaleBiasId,
-                            GetNgxTextureScaleBias(rgContext, data.Motion));
-                        rgContext.cmd.DrawProcedural(Matrix4x4.identity, data.Material, 0,
-                            MeshTopology.Triangles, 3, 1, data.Properties);
-                    });
-                }
+                        ctx.MotionHandle.nameID,
+                        ctx.DepthHandle.nameID,
+                    };
+                    // These inputs carry no depth-stencil surface; reuse a color
+                    // attachment as the (unused, ZTest Always / ZWrite Off) depth slot.
+                    cmd.SetRenderTarget(targets, ctx.MotionHandle.nameID);
+                    cmd.SetViewport(new Rect(0f, 0f, width, height));
 
-                if (debugActive && resources.activeColorTexture.IsValid())
-                {
-                    Matrix4x4 clipToPrevClip = prevViewProj * viewProj.inverse;
-                    using (IRasterRenderGraphBuilder builder =
-                        renderGraph.AddRasterRenderPass<DebugPassData>(
-                            "DLSS-G Validate Inputs", out DebugPassData passData, profilingSampler))
+                    _properties.Clear();
+                    _properties.SetTexture(InputDepthId, sourceDepth);
+                    _properties.SetTexture(InputMotionId, sourceMotion);
+                    _properties.SetVector(DepthScaleBiasId, GetNgxTextureScaleBias());
+                    _properties.SetVector(MotionScaleBiasId, GetNgxTextureScaleBias());
+                    cmd.DrawProcedural(Matrix4x4.identity, _feature._prepareMaterial, 0,
+                        MeshTopology.Triangles, 3, 1, _properties);
+
+                    if (debugActive && Renderer != null && Renderer.cameraColorTargetHandle != null)
                     {
-                        passData.Depth = depth;
-                        passData.Motion = motion;
-                        passData.Material = _feature._prepareMaterial;
-                        passData.Properties = new MaterialPropertyBlock();
-                        passData.ClipToPrevClip = clipToPrevClip;
-                        passData.Size = new Vector4(width, height, 1f / width, 1f / height);
-                        passData.Params = new Vector4((float)_feature.debugView,
+                        Matrix4x4 clipToPrevClip = prevViewProj * viewProj.inverse;
+                        CoreUtils.SetRenderTarget(cmd, Renderer.cameraColorTargetHandle);
+                        _properties.Clear();
+                        _properties.SetTexture(DebugDepthId, ctx.DepthHandle);
+                        _properties.SetTexture(DebugMotionId, ctx.MotionHandle);
+                        _properties.SetMatrix(DebugClipToPrevClipId, clipToPrevClip);
+                        _properties.SetVector(DebugSizeId,
+                            new Vector4(width, height, 1f / width, 1f / height));
+                        _properties.SetVector(DebugParamsId, new Vector4((float)_feature.debugView,
                             SystemInfo.usesReversedZBuffer ? 1f : 0f,
                             Mathf.Max(1f, _feature.debugMotionRangePixels),
-                            Mathf.Max(1e-4f, camera.nearClipPlane));
-                        passData.MotionScale = new Vector4(-width, -height, 0f, 0f);
-                        builder.UseTexture(depth, AccessFlags.Read);
-                        builder.UseTexture(motion, AccessFlags.Read);
-                        builder.SetRenderAttachment(resources.activeColorTexture, 0, AccessFlags.WriteAll);
-                        builder.AllowPassCulling(false);
-                        builder.SetRenderFunc(static (DebugPassData data, RasterGraphContext rgContext) =>
-                        {
-                            data.Properties.Clear();
-                            data.Properties.SetTexture(DebugDepthId, data.Depth);
-                            data.Properties.SetTexture(DebugMotionId, data.Motion);
-                            data.Properties.SetMatrix(DebugClipToPrevClipId, data.ClipToPrevClip);
-                            data.Properties.SetVector(DebugSizeId, data.Size);
-                            data.Properties.SetVector(DebugParamsId, data.Params);
-                            data.Properties.SetVector(DebugMotionScaleId, data.MotionScale);
-                            rgContext.cmd.DrawProcedural(Matrix4x4.identity, data.Material, 1,
-                                MeshTopology.Triangles, 3, 1, data.Properties);
-                        });
+                            Mathf.Max(1e-4f, camera.nearClipPlane)));
+                        _properties.SetVector(DebugMotionScaleId, new Vector4(-width, -height, 0f, 0f));
+                        cmd.DrawProcedural(Matrix4x4.identity, _feature._prepareMaterial, 1,
+                            MeshTopology.Triangles, 3, 1, _properties);
                     }
-                }
 
-                if (preparedInputs.SubmitToNgx)
-                {
-                    // Outside a native raster pass, after all input/debug reads.
-                    // The native recording event establishes the final SRV state;
-                    // the submission event publishes the matching camera packet.
-                    using (var builder = renderGraph.AddUnsafePass<SubmitPassData>(
-                        "DLSS-G Submit Inputs", out var passData, profilingSampler))
+                    if (submitToNgx)
                     {
-                        passData.Inputs = preparedInputs;
-                        builder.UseTexture(depth, AccessFlags.ReadWrite);
-                        builder.UseTexture(motion, AccessFlags.ReadWrite);
-                        builder.AllowPassCulling(false);
-                        builder.SetRenderFunc(static (SubmitPassData data, UnsafeGraphContext rgContext) =>
+                        // Submit after the copy so NGX reads the finished SRVs.
+                        var submit = new SubmitData
                         {
-                            CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(rgContext.cmd);
-                            SubmitInputs(data.Inputs, cmd);
-                        });
+                            Context = ctx,
+                            ViewToClip = viewToClip,
+                            ViewProj = viewProj,
+                            PrevViewProj = prevViewProj,
+                            Position = position,
+                            Up = camera.transform.up,
+                            Right = camera.transform.right,
+                            Forward = camera.transform.forward,
+                            JitterPixels = jitterPixels,
+                            // DLSS-G consumes current-to-previous motion in pixels. URP
+                            // stores previous-to-current motion in normalized screen UV.
+                            MotionScale = new Vector2(-width, -height),
+                            Near = Mathf.Max(1e-4f, camera.nearClipPlane),
+                            Far = camera.farClipPlane,
+                            Fov = camera.fieldOfView * Mathf.Deg2Rad,
+                            Aspect = (float)width / Mathf.Max(1, height),
+                            ColorWidth = Mathf.Max(1, Screen.width),
+                            ColorHeight = Mathf.Max(1, Screen.height),
+                            FrameIndex = Time.frameCount,
+                            Reset = reset,
+                            ColorBuffersHdr = cameraData.isHDROutputActive,
+                        };
+                        SubmitInputs(submit, cmd);
                     }
                 }
+
+                context.ExecuteCommandBuffer(cmd);
+                CommandBufferPool.Release(cmd);
             }
 
-            private static Vector4 GetNgxTextureScaleBias(
-                in RasterGraphContext context, in TextureHandle source)
+            private static Vector4 GetNgxTextureScaleBias()
             {
-                // NGX consumes raw D3D resources using a top-left origin. Normalize
-                // Unity's logical texture orientation while copying into our inputs.
-                bool flipY = context.GetTextureUVOrigin(in source) ==
-                    TextureUVOrigin.BottomLeft;
-                return flipY
-                    ? new Vector4(1f, -1f, 0f, 1f)
-                    : new Vector4(1f, 1f, 0f, 0f);
+                // NGX consumes raw D3D resources using a top-left origin. On D3D12
+                // (the only supported backend) sampling URP's global depth/motion
+                // with a full-screen triangle already lands in top-left space, so
+                // no vertical flip is needed. Keep the flipped branch as a guard
+                // for backends whose logical textures start at the bottom-left.
+                return SystemInfo.graphicsUVStartsAtTop
+                    ? new Vector4(1f, 1f, 0f, 0f)
+                    : new Vector4(1f, -1f, 0f, 1f);
             }
 
-            private static bool IsTexArray(
-                in UnityEngine.Rendering.RenderGraphModule.TextureDesc desc) =>
-                desc.dimension == UnityEngine.Rendering.TextureDimension.Tex2DArray &&
-                desc.slices > 1;
+            private static bool IsTexArray(RenderTexture texture) =>
+                texture.dimension == UnityEngine.Rendering.TextureDimension.Tex2DArray &&
+                texture.volumeDepth > 1;
 
-            private static Vector2 ExtractJitterPixels(UniversalCameraData cameraData,
+            private static Vector2 ExtractJitterPixels(CameraData cameraData,
                 in Matrix4x4 unjitteredProjection, int width, int height)
             {
                 Matrix4x4 jittered = cameraData.GetProjectionMatrix();
@@ -553,7 +509,7 @@ namespace UnityRhi.Dlss.Urp
                     translation.m13 * 0.5f * height);
             }
 
-            private static void SubmitInputs(PreparePassData data, CommandBuffer commandBuffer)
+            private static void SubmitInputs(SubmitData data, CommandBuffer commandBuffer)
             {
                 IntPtr depth = data.Context.DepthRt.GetNativeTexturePtr();
                 IntPtr motion = data.Context.MotionRt.GetNativeTexturePtr();

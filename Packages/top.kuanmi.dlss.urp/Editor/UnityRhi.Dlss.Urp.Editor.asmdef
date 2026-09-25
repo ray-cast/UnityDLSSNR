@@ -22,7 +22,7 @@
   "versionDefines": [
     {
       "name": "com.unity.render-pipelines.universal",
-      "expression": "17.0.0",
+      "expression": "14.0.0",
       "define": "UNITYRHI_DLSS_URP"
     }
   ],

@@ -21,6 +21,7 @@ Shader "Hidden/UnityRHI/DLSS-G/PrepareInputs"
 
             TEXTURE2D(_DlssFgInputDepth);
             TEXTURE2D(_DlssFgInputMotion);
+            SAMPLER(sampler_PointClamp);
             float4 _DlssFgDepthScaleBias;
             float4 _DlssFgMotionScaleBias;
 
@@ -86,6 +87,7 @@ Shader "Hidden/UnityRHI/DLSS-G/PrepareInputs"
 
             TEXTURE2D(_DlssFgDebugDepth);
             TEXTURE2D(_DlssFgDebugMotion);
+            SAMPLER(sampler_PointClamp);
             float4x4 _DlssFgDebugClipToPrevClip;
             float4 _DlssFgDebugSize;   // width, height, 1/width, 1/height
             float4 _DlssFgDebugParams; // mode, depthInverted, motionRangePixels, near
